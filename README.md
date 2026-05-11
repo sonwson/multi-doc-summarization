@@ -45,14 +45,6 @@ Giá trị mẫu hiện tại:
 
 `backend/.env`
 
-```env
-PORT=5000
-MONGODB_URI=mongodb://127.0.0.1:27017/multi-doc-summarization
-ALLOW_IN_MEMORY_DB=true
-JWT_SECRET=super-secret-key
-CLIENT_URL=http://localhost:5173
-AI_SERVER_URL=http://127.0.0.1:8000/api/summarize
-```
 
 `frontend/.env`
 
