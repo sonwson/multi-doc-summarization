@@ -1,0 +1,11 @@
+*.log
+.env
+.env.*
+!.env.example
+!**/.env.example
+results/
+frontend/node_modules/
+frontend/dist/
+results/
+frontend/node_modules/
+frontend/dist/

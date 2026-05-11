@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+torch
+transformers==4.46.3
+numpy

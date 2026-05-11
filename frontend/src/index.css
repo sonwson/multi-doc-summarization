@@ -1,0 +1,11 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  font-family: "Segoe UI", sans-serif;
+  color: #1f2937;
+  background:
+    radial-gradient(circle at top left, rgba(0, 210, 180, 0.16), transparent 30%),
+    linear-gradient(180deg, #f8fffe 0%, #f8fafc 100%);
+}
