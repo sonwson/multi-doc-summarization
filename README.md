@@ -133,17 +133,3 @@ Nếu frontend mở được nhưng bấm tóm tắt không chạy, kiểm tra l
 
 - `results/checkpoints_extractive/best_extractive_sentence_model.bin`
 - `results/checkpoints_extractive/tokenizer/`
-
-Đây là dữ liệu model/runtime, không nên đẩy lên GitHub repo thường.
-
-## Lưu ý khi push GitHub
-
-Không push các thư mục và file sau:
-
-- `.env`
-- `node_modules/`
-- `frontend/dist/`
-- `results/`
-- `*.log`
-
-Repo đã có `.gitignore` để bỏ qua các file này.
