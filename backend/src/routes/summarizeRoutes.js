@@ -2,7 +2,7 @@ import express from 'express';
 import axios from 'axios';
 import multer from 'multer';
 import { PDFParse } from 'pdf-parse';
-import { protect } from '../middleware/authMiddleware.js';
+import { optionalAuth } from '../middleware/authMiddleware.js';
 import { History } from '../models/History.js';
 
 const router = express.Router();
@@ -45,7 +45,7 @@ const handleUpload = (req, res, next) => {
   });
 };
 
-router.post('/', protect, handleUpload, async (req, res) => {
+router.post('/', optionalAuth, handleUpload, async (req, res) => {
   try {
     const rawInputs = req.body.inputs;
     const parsedInputs = Array.isArray(rawInputs)
@@ -77,14 +77,16 @@ router.post('/', protect, handleUpload, async (req, res) => {
 
     const summary = aiResponse.data.summary || 'No summary returned from AI service.';
 
-    const history = await History.create({
-      user: req.user.id,
-      inputs,
-      summary,
-      sourceFiles: fileNames
-    });
+    const history = req.user
+      ? await History.create({
+          user: req.user.id,
+          inputs,
+          summary,
+          sourceFiles: fileNames
+        })
+      : null;
 
-    return res.status(201).json({ summary, history });
+    return res.status(201).json({ summary, history, savedToHistory: Boolean(history) });
   } catch (error) {
     const detail = error.response?.data || error.message;
     return res.status(500).json({ message: 'Summarization failed', detail });

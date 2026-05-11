@@ -1,15 +1,23 @@
 import React from 'react';
 import { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import api from '../api/axios';
 import SummaryForm from '../components/SummaryForm';
+import { useAuth } from '../context/AuthContext';
 
 export default function WorkspacePage() {
+  const { user } = useAuth();
   const [history, setHistory] = useState([]);
   const [isFullscreen, setIsFullscreen] = useState(Boolean(document.fullscreenElement));
 
   useEffect(() => {
+    if (!user) {
+      setHistory([]);
+      return;
+    }
+
     api.get('/history').then(({ data }) => setHistory(data)).catch(() => {});
-  }, []);
+  }, [user]);
 
   useEffect(() => {
     const handleFullscreenChange = () => {
@@ -41,6 +49,11 @@ export default function WorkspacePage() {
             <p className="mt-3 max-w-3xl text-gray-500">
               Paste multiple documents, attach text files, and keep every result in your private history.
             </p>
+            {!user && (
+              <p className="mt-3 text-sm text-gray-600">
+                You can summarize immediately as a guest. To save results, <Link to="/login" className="font-medium text-teal-700">log in here</Link>.
+              </p>
+            )}
           </div>
           <button
             onClick={toggleFullscreen}

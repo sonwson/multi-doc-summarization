@@ -70,6 +70,62 @@ router.get('/me', protect, async (req, res) => {
   return res.json(user);
 });
 
+router.put('/me', protect, async (req, res) => {
+  try {
+    const { name, email } = req.body;
+
+    if (!name || !email) {
+      return res.status(400).json({ message: 'Name and email are required' });
+    }
+
+    const existingUser = await User.findOne({
+      email,
+      _id: { $ne: req.user.id }
+    });
+
+    if (existingUser) {
+      return res.status(409).json({ message: 'Email already exists' });
+    }
+
+    const user = await User.findByIdAndUpdate(
+      req.user.id,
+      { name: name.trim(), email: email.trim().toLowerCase() },
+      { new: true, runValidators: true }
+    ).select('-password');
+
+    return res.json(user);
+  } catch (error) {
+    return res.status(500).json({ message: 'Profile update failed', error: error.message });
+  }
+});
+
+router.put('/change-password', protect, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ message: 'Current password and new password are required' });
+    }
+
+    const user = await User.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const matches = await bcrypt.compare(currentPassword, user.password);
+    if (!matches) {
+      return res.status(401).json({ message: 'Current password is incorrect' });
+    }
+
+    user.password = await bcrypt.hash(newPassword, 10);
+    await user.save();
+
+    return res.json({ message: 'Password updated successfully' });
+  } catch (error) {
+    return res.status(500).json({ message: 'Password update failed', error: error.message });
+  }
+});
+
 router.post('/logout', (req, res) => {
   res.clearCookie('token');
   return res.json({ message: 'Logged out successfully' });

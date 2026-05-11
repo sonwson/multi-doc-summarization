@@ -26,6 +26,10 @@ export const AuthProvider = ({ children }) => {
     setUser(profile);
   };
 
+  const updateUser = (profile) => {
+    setUser(profile);
+  };
+
   const logout = () => {
     api.post('/auth/logout').catch(() => {});
     localStorage.removeItem('token');
@@ -33,7 +37,7 @@ export const AuthProvider = ({ children }) => {
   };
 
   return (
-    <AuthContext.Provider value={{ user, loading, saveAuth, logout }}>
+    <AuthContext.Provider value={{ user, loading, saveAuth, updateUser, logout }}>
       {children}
     </AuthContext.Provider>
   );

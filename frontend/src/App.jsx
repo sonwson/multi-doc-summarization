@@ -7,25 +7,36 @@ import HistoryPage from './pages/HistoryPage';
 import LoginPage from './pages/LoginPage';
 import RegisterPage from './pages/RegisterPage';
 import WorkspacePage from './pages/WorkspacePage';
+import ProfilePage from './pages/ProfilePage';
+import ChangePasswordPage from './pages/ChangePasswordPage';
 
 export default function App() {
   return (
     <AuthProvider>
       <Layout>
         <Routes>
-          <Route
-            path="/"
-            element={
-              <ProtectedRoute>
-                <WorkspacePage />
-              </ProtectedRoute>
-            }
-          />
+          <Route path="/" element={<WorkspacePage />} />
           <Route
             path="/history"
             element={
               <ProtectedRoute>
                 <HistoryPage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/profile"
+            element={
+              <ProtectedRoute>
+                <ProfilePage />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/change-password"
+            element={
+              <ProtectedRoute>
+                <ChangePasswordPage />
               </ProtectedRoute>
             }
           />

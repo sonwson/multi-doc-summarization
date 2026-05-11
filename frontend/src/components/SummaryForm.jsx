@@ -1,16 +1,19 @@
 import React from 'react';
 import { useState } from 'react';
 import api from '../api/axios';
+import { useAuth } from '../context/AuthContext';
 
 const MAX_SOURCES = 10;
 const createBlock = () => ({ id: crypto.randomUUID(), value: '' });
 
 export default function SummaryForm({ onCreated }) {
+  const { user } = useAuth();
   const [blocks, setBlocks] = useState([createBlock()]);
   const [files, setFiles] = useState([]);
   const [summary, setSummary] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [saveMessage, setSaveMessage] = useState('');
 
   const totalSources = blocks.length + files.length;
   const remainingSlots = Math.max(0, MAX_SOURCES - totalSources);
@@ -65,6 +68,7 @@ export default function SummaryForm({ onCreated }) {
   const handleSubmit = async () => {
     setLoading(true);
     setError('');
+    setSaveMessage('');
 
     try {
       const formData = new FormData();
@@ -90,7 +94,10 @@ export default function SummaryForm({ onCreated }) {
       });
 
       setSummary(data.summary);
-      onCreated(data.history);
+      setSaveMessage(data.savedToHistory ? 'Summary saved to your history.' : 'Guest mode: result is not saved to history.');
+      if (data.history) {
+        onCreated(data.history);
+      }
     } catch (err) {
       setError(err.response?.data?.message || 'Unable to summarize documents');
     } finally {
@@ -132,6 +139,10 @@ export default function SummaryForm({ onCreated }) {
 
         <div className="mt-4 rounded-2xl bg-slate-50 px-4 py-3 text-sm text-gray-600">
           Sources used: {totalSources}/{MAX_SOURCES}. Remaining slots: {remainingSlots}.
+        </div>
+
+        <div className="mt-4 rounded-2xl border border-dashed border-teal-200 bg-teal-50/70 px-4 py-3 text-sm text-teal-800">
+          {user ? 'Signed in: summaries from this workspace will be saved to history.' : 'Guest mode: you can summarize without logging in, but results will not be saved.'}
         </div>
 
         <div className="mt-6 space-y-4">
@@ -181,6 +192,7 @@ export default function SummaryForm({ onCreated }) {
         )}
 
         {error && <p className="mt-4 text-sm text-rose-500">{error}</p>}
+        {saveMessage && <p className="mt-4 text-sm text-teal-700">{saveMessage}</p>}
 
         <div className="mt-6 flex flex-wrap gap-3">
           <button
