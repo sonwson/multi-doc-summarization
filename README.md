@@ -45,14 +45,6 @@ Giá trị mẫu hiện tại:
 
 `backend/.env`
 
-```env
-PORT=5000
-MONGODB_URI=mongodb://127.0.0.1:27017/multi-doc-summarization
-ALLOW_IN_MEMORY_DB=true
-JWT_SECRET=super-secret-key
-CLIENT_URL=http://localhost:5173
-AI_SERVER_URL=http://127.0.0.1:8000/api/summarize
-```
 
 `frontend/.env`
 
@@ -141,17 +133,3 @@ Nếu frontend mở được nhưng bấm tóm tắt không chạy, kiểm tra l
 
 - `results/checkpoints_extractive/best_extractive_sentence_model.bin`
 - `results/checkpoints_extractive/tokenizer/`
-
-Đây là dữ liệu model/runtime, không nên đẩy lên GitHub repo thường.
-
-## Lưu ý khi push GitHub
-
-Không push các thư mục và file sau:
-
-- `.env`
-- `node_modules/`
-- `frontend/dist/`
-- `results/`
-- `*.log`
-
-Repo đã có `.gitignore` để bỏ qua các file này.
