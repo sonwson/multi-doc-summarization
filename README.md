@@ -1,6 +1,12 @@
-# Multi-Documents Summarization Template
+# Multi-Document Summarization
 
-## Folder structure
+Ứng dụng web tóm tắt nhiều tài liệu trong một lần nhập, gồm 3 phần:
+
+- `frontend/`: giao diện React + Vite
+- `backend/`: API Express, auth và history
+- `ai-service/`: FastAPI chạy model tóm tắt extractive
+
+## Cấu trúc thư mục
 
 ```text
 multi-documents_summarization/
@@ -9,42 +15,118 @@ multi-documents_summarization/
 |   `-- requirements.txt
 |-- backend/
 |   |-- src/
-|   |   |-- config/
-|   |   |-- middleware/
-|   |   |-- models/
-|   |   |-- routes/
-|   |   |-- utils/
-|   |   |-- app.js
-|   |   `-- server.js
 |   |-- .env.example
 |   `-- package.json
 |-- frontend/
 |   |-- src/
-|   |   |-- api/
-|   |   |-- components/
-|   |   |-- context/
-|   |   `-- pages/
 |   |-- .env.example
-|   |-- index.html
-|   |-- package.json
-|   |-- postcss.config.js
-|   `-- tailwind.config.js
+|   `-- package.json
 |-- results/
+|   `-- checkpoints_extractive/
 `-- README.md
 ```
 
-## Quick start
+## Yêu cầu
 
-1. Create `.env` files from each `.env.example`.
-2. Install dependencies:
-   - `cd backend && npm install`
-   - `cd frontend && npm install`
-   - `cd ai-service && pip install -r requirements.txt`
-3. Run AI service: `uvicorn app:app --reload --host 127.0.0.1 --port 8000`
-4. Run backend: `npm run dev`
-5. Run frontend: `npm run dev`
+- Node.js 18+
+- Python 3.10+
+- `pip`
 
-## API overview
+## Chuẩn bị biến môi trường
+
+Tạo file `.env` từ file mẫu:
+
+```powershell
+Copy-Item backend\.env.example backend\.env
+Copy-Item frontend\.env.example frontend\.env
+```
+
+Giá trị mẫu hiện tại:
+
+`backend/.env`
+
+```env
+PORT=5000
+MONGODB_URI=mongodb://127.0.0.1:27017/multi-doc-summarization
+ALLOW_IN_MEMORY_DB=true
+JWT_SECRET=super-secret-key
+CLIENT_URL=http://localhost:5173
+AI_SERVER_URL=http://127.0.0.1:8000/api/summarize
+```
+
+`frontend/.env`
+
+```env
+VITE_API_URL=http://localhost:5000/api
+```
+
+## Cài dependencies
+
+### Frontend
+
+```powershell
+cd frontend
+npm install
+```
+
+### Backend
+
+```powershell
+cd backend
+npm install
+```
+
+### AI service
+
+```powershell
+cd ai-service
+pip install -r requirements.txt
+```
+
+## Cách chạy local
+
+Mở 3 terminal riêng.
+
+### 1. Chạy AI service
+
+```powershell
+cd D:\multi-documents_summarization\ai-service
+uvicorn app:app --reload --host 127.0.0.1 --port 8000
+```
+
+Health check:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/health
+```
+
+### 2. Chạy backend
+
+```powershell
+cd D:\multi-documents_summarization\backend
+npm run dev
+```
+
+Backend mặc định chạy ở `http://localhost:5000`.
+
+### 3. Chạy frontend
+
+```powershell
+cd D:\multi-documents_summarization\frontend
+npm run dev
+```
+
+Frontend mặc định chạy ở `http://localhost:5173`.
+
+## Thứ tự khởi động nên dùng
+
+1. `ai-service`
+2. `backend`
+3. `frontend`
+
+Nếu frontend mở được nhưng bấm tóm tắt không chạy, kiểm tra lại `AI_SERVER_URL` trong `backend/.env` và chắc chắn AI service đang chạy.
+
+## API chính
 
 - `POST /api/auth/register`
 - `POST /api/auth/login`
@@ -53,29 +135,23 @@ multi-documents_summarization/
 - `GET /api/history`
 - `DELETE /api/history/:id`
 
-## AI server contract
+## Model đang dùng
 
-Backend expects your AI service to accept:
-
-```json
-{
-  "documents": ["doc 1", "doc 2", "doc 3"]
-}
-```
-
-And return:
-
-```json
-{
-  "summary": "Combined summary text"
-}
-```
-
-## Integrated trained model
-
-The web app is now wired to the trained checkpoint at:
+`ai-service/app.py` đang load checkpoint từ:
 
 - `results/checkpoints_extractive/best_extractive_sentence_model.bin`
 - `results/checkpoints_extractive/tokenizer/`
 
-`ai-service/app.py` loads this checkpoint directly with PhoBERT, scores candidate sentences, and returns an extractive summary through `POST /api/summarize`.
+Đây là dữ liệu model/runtime, không nên đẩy lên GitHub repo thường.
+
+## Lưu ý khi push GitHub
+
+Không push các thư mục và file sau:
+
+- `.env`
+- `node_modules/`
+- `frontend/dist/`
+- `results/`
+- `*.log`
+
+Repo đã có `.gitignore` để bỏ qua các file này.
