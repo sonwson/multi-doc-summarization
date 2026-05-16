@@ -133,7 +133,7 @@ class PhoBERTSentenceClassifier(nn.Module):
     ))
     self.numeric_dim = int(numeric_dim or 0)
     if self.numeric_dim > 0:
-      self.numeric = nn.Sequential(
+      self.numeric_encoder = nn.Sequential(
         nn.LayerNorm(self.numeric_dim),
         nn.Linear(self.numeric_dim, max(1, proj_dim)),
         nn.GELU(),
@@ -141,7 +141,7 @@ class PhoBERTSentenceClassifier(nn.Module):
       )
       classifier_in = 768 + max(1, proj_dim)
     else:
-      self.numeric = None
+      self.numeric_encoder = None
       classifier_in = 768
     self.dropout = nn.Dropout(dropout)
     self.classifier = nn.Sequential(
@@ -153,10 +153,10 @@ class PhoBERTSentenceClassifier(nn.Module):
 
   def forward(self, input_ids, attention_mask=None, numeric_features=None):
     cls = self.dropout(self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[:, 0])
-    if self.numeric is not None:
+    if self.numeric_encoder is not None:
       if numeric_features is None:
         numeric_features = torch.zeros((cls.size(0), self.numeric_dim), dtype=cls.dtype, device=cls.device)
-      cls = torch.cat([cls, self.numeric(numeric_features.to(dtype=cls.dtype, device=cls.device))], dim=1)
+      cls = torch.cat([cls, self.numeric_encoder(numeric_features.to(dtype=cls.dtype, device=cls.device))], dim=1)
     return self.classifier(cls).squeeze(-1)
 
 
@@ -190,6 +190,23 @@ def jaccard(a: str, b: str) -> float:
 def stable_hash(text: str) -> str:
   import hashlib
   return hashlib.md5(normalize(text).lower().encode("utf-8")).hexdigest()[:12]
+
+
+def create_topic_ids_from_title_tags(df: pd.DataFrame) -> pd.DataFrame:
+  df = df.copy()
+  df["topic_text"] = (df["title"].fillna("") + " " + df["tags"].fillna("")).map(normalize)
+  df["topic_key"] = df["topic_text"].map(lambda value: stable_hash(value) if value else "")
+  df["topic_id"] = -1
+  for _, idxs in df.groupby("cluster_id", sort=False).groups.items():
+    key_to_id = {}
+    next_id = 0
+    for idx in list(idxs):
+      key = df.at[idx, "topic_key"] or f"DOC::{df.at[idx, 'doc_id']}"
+      if key not in key_to_id:
+        key_to_id[key] = next_id
+        next_id += 1
+      df.at[idx, "topic_id"] = key_to_id[key]
+  return df
 
 
 def model_input(row) -> str:
@@ -369,6 +386,31 @@ def auto_generate_title(content: str, max_words: int = 12) -> str:
   return title[:1].upper() + title[1:] if title else title
 
 
+def add_numeric_features(df: pd.DataFrame, cfg) -> pd.DataFrame:
+  df = df.copy().sort_values(["cluster_id", "sent_clus_pos", "doc_id", "sent_doc_pos", "raw_index"], kind="stable").reset_index(drop=True)
+  cluster_size = df.groupby("cluster_id")["sentence"].transform("size").astype(float)
+  doc_size = df.groupby(["cluster_id", "doc_id"], dropna=False)["sentence"].transform("size").astype(float)
+  topic_size = df.groupby(["cluster_id", "topic_id"], dropna=False)["sentence"].transform("size").astype(float)
+  doc_order = df.groupby(["cluster_id", "doc_id"], dropna=False).cumcount().astype(float)
+  cluster_order = df.groupby("cluster_id", dropna=False).cumcount().astype(float)
+  sent_doc_pos = pd.to_numeric(df["sent_doc_pos"], errors="coerce").fillna(-1).astype(float)
+  sent_clus_pos = pd.to_numeric(df["sent_clus_pos"], errors="coerce").fillna(-1).astype(float)
+  safe_doc_pos = np.where(sent_doc_pos >= 0, sent_doc_pos, doc_order)
+  safe_clus_pos = np.where(sent_clus_pos >= 0, sent_clus_pos, cluster_order)
+  df["sent_doc_pos_norm"] = safe_doc_pos / np.maximum(doc_size.values - 1.0, 1.0)
+  df["sent_clus_pos_norm"] = safe_clus_pos / np.maximum(cluster_size.values - 1.0, 1.0)
+  n_words = pd.to_numeric(df["n_words"], errors="coerce").fillna(0).astype(float)
+  df["n_words_norm"] = np.clip(np.log1p(n_words) / np.log1p(80.0), 0.0, 1.0)
+  df["title_overlap"] = [jaccard(sent, title) for sent, title in zip(df["sentence"].fillna(""), df["title"].fillna(""))]
+  df["tag_overlap"] = [jaccard(sent, tags) for sent, tags in zip(df["sentence"].fillna(""), df["tags"].fillna(""))]
+  df["doc_size_norm"] = np.clip(doc_size.values / np.maximum(cluster_size.values, 1.0), 0.0, 1.0)
+  df["topic_size_norm"] = np.clip(topic_size.values / np.maximum(cluster_size.values, 1.0), 0.0, 1.0)
+  if getattr(cfg, "USE_NUMERIC_FEATURES", False):
+    for col in cfg.NUMERIC_FEATURE_COLUMNS:
+      df[col] = pd.to_numeric(df.get(col, 0.0), errors="coerce").fillna(0.0).astype("float32").clip(lower=0.0, upper=1.0)
+  return df
+
+
 def build_custom_df(contents, cfg, cluster_id: str = "CUSTOM_CONTENT"):
   if isinstance(contents, str):
     contents = [contents]
@@ -427,6 +469,10 @@ def add_scores(df: pd.DataFrame, probs: np.ndarray, cfg) -> pd.DataFrame:
   out["topic_relevance"] = out["sentence"].apply(relevance)
   out["final_score"] = cfg.MMR_ALPHA * out["model_score"] + cfg.POSITION_BONUS_WEIGHT * out["position_score"] + cfg.TOPIC_RELEVANCE_WEIGHT * out["topic_relevance"]
   return out
+
+
+def clamp_value(value: int, low: int, high: int) -> int:
+  return max(low, min(high, value))
 
 
 def runtime_cfg(cfg, scored: pd.DataFrame, mode: str):
