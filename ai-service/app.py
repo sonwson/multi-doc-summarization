@@ -1,13 +1,18 @@
+import math
 import os
 import re
+import unicodedata
+from collections import Counter, defaultdict
 from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
 from typing import List
 
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 os.environ.setdefault("USE_TF", "0")
 
 import numpy as np
+import pandas as pd
 import torch
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
@@ -16,9 +21,87 @@ from transformers import PhobertTokenizer, RobertaConfig, RobertaModel
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-CHECKPOINT_PATH = ROOT_DIR / "results" / "checkpoints_extractive" / "best_extractive_sentence_model.bin"
+CHECKPOINT_PATH = ROOT_DIR / "phobert_outputs" / "best_model.pt"
 TOKENIZER_DIR = ROOT_DIR / "results" / "checkpoints_extractive" / "tokenizer"
-DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+CFG_DEFAULTS = {
+  "MAX_LEN": 256,
+  "DROPOUT": 0.30,
+  "USE_NUMERIC_FEATURES": True,
+  "NUMERIC_FEATURE_COLUMNS": (
+    "sent_doc_pos_norm",
+    "sent_clus_pos_norm",
+    "n_words_norm",
+    "title_overlap",
+    "tag_overlap",
+    "doc_size_norm",
+    "topic_size_norm",
+  ),
+  "NUMERIC_FEATURE_PROJ_DIM": 16,
+  "TASK_MODE": "auto",
+  "USE_ADAPTIVE_BUDGET": True,
+  "SUMMARY_MAX_SENTENCES": 12,
+  "SUMMARY_MAX_WORDS": 450,
+  "MIN_REQUIRED_SENTENCES": 3,
+  "ADAPTIVE_MIN_SENTENCES": 3,
+  "ADAPTIVE_SINGLE_MAX_SENTENCES": 8,
+  "ADAPTIVE_MULTI_MAX_SENTENCES": 10,
+  "ADAPTIVE_SINGLE_MAX_WORDS": 260,
+  "ADAPTIVE_MULTI_MAX_WORDS": 320,
+  "MMR_ALPHA": 0.65,
+  "REDUNDANCY_WEIGHT": 0.30,
+  "TOPIC_COVERAGE_WEIGHT": 0.15,
+  "DOC_COVERAGE_WEIGHT": 0.06,
+  "POSITION_BONUS_WEIGHT": 0.04,
+  "TOPIC_RELEVANCE_WEIGHT": 0.12,
+  "MAX_PER_TOPIC": 2,
+  "MAX_PER_TOPIC_SINGLE": 7,
+  "MAX_PER_TOPIC_MULTI": 2,
+  "AUTO_MULTI_TOPIC_MIN_TOPICS": 3,
+  "FILTER_WEAK_TOPICS_IN_MULTI": True,
+  "MIN_TOPIC_SCORE_RATIO": 0.60,
+  "MIN_SENT_SCORE": 0.20,
+  "MAX_REDUNDANCY_JACCARD": 0.55,
+  "FILTER_OFF_TOPIC_IN_SINGLE": True,
+  "TOPIC_RELEVANCE_THRESHOLD": 0.06,
+}
+
+STOPWORDS = set("""
+và là của có cho với trong trên dưới một những các được đã đang sẽ thì mà này đó
+khi như về từ tại bởi vì do để hơn rất cũng không vào ra đến sau trước giữa
+người việc năm ngày tháng theo nhiều ít lại nếu nên hay hoặc cùng mỗi
+bên cạnh ngoài ra tuy nhiên dù vậy vẫn còn dù mặc dù
+hiện nay gần đây tương lai quá trình thông qua nhằm đối với liên quan
+có thể cần phải giúp khiến làm bị bởi đây kia ấy
+""".split())
+PHRASE_SPLIT = STOPWORDS | set("""
+phát triển trở thành phổ biến nhanh chậm mạnh rõ rệt thường xuyên
+hoạt động quá trình vấn đề điều yếu tố vai trò hình thức kết quả hiệu quả
+cho phép phụ thuộc đòi hỏi gặp đối mặt sử dụng áp dụng triển khai
+thông tin nội dung dịch vụ quyết định quan trọng hiện đại
+""".split())
+GENERIC = set("""
+vấn đề hoạt động quá trình kết quả hiệu quả hình thức nền tảng hệ thống mô hình
+dữ liệu thông tin dịch vụ nội dung phương pháp giải pháp yếu tố vai trò chất lượng
+người dùng học sinh sinh viên doanh nghiệp chuyên gia bệnh viện
+""".split())
+BAD_PHRASES = {
+  p.strip() for p in """
+học tập lĩnh vực hình thức kết quả hiệu quả quốc gia mọi nơi
+ngày tháng hiện nay gần đây tương lai vấn đề quan trọng hoạt động trực tuyến
+""".split("\n") if p.strip()
+}
+BAD_EDGE = set("lĩnh vực hình thức kết quả hiệu quả quốc gia mọi nơi tập dễ xuất cận phép phụ thuộc".split())
+DECODE_STOP = set("""
+và là của có cho với trong trên dưới một những các được đã đang sẽ thì mà này đó
+khi như về từ tại bởi vì do để hơn rất cũng không vào ra đến sau trước giữa
+người việc năm ngày tháng theo nhiều ít lại nếu nên hay hoặc cùng mỗi
+ra vào lên xuống làm bị bởi đây kia ấy nhằm thông qua
+""".split())
+for w in ["biến", "hiện", "phát"]:
+  STOPWORDS.discard(w)
+  PHRASE_SPLIT.discard(w)
 
 app = FastAPI(title="AI Summarization Service", version="1.0.0")
 
@@ -39,187 +122,404 @@ class SummarizeResponse(BaseModel):
   meta: dict
 
 
-class ExtractiveSentenceRanker(nn.Module):
-  def __init__(self):
+class PhoBERTSentenceClassifier(nn.Module):
+  def __init__(self, dropout: float, numeric_dim: int, proj_dim: int):
     super().__init__()
-    self.encoder = RobertaModel(
-      RobertaConfig(
-        vocab_size=64001,
-        hidden_size=768,
-        num_hidden_layers=12,
-        num_attention_heads=12,
-        intermediate_size=3072,
-        hidden_act="gelu",
-        hidden_dropout_prob=0.1,
-        attention_probs_dropout_prob=0.1,
-        max_position_embeddings=258,
-        type_vocab_size=1,
-        pad_token_id=1,
-        bos_token_id=0,
-        eos_token_id=2,
-        layer_norm_eps=1e-5,
+    self.encoder = RobertaModel(RobertaConfig(
+      vocab_size=64001, hidden_size=768, num_hidden_layers=12, num_attention_heads=12,
+      intermediate_size=3072, hidden_act="gelu", hidden_dropout_prob=0.1,
+      attention_probs_dropout_prob=0.1, max_position_embeddings=258, type_vocab_size=1,
+      pad_token_id=1, bos_token_id=0, eos_token_id=2, layer_norm_eps=1e-5,
+    ))
+    self.numeric_dim = int(numeric_dim or 0)
+    if self.numeric_dim > 0:
+      self.numeric = nn.Sequential(
+        nn.LayerNorm(self.numeric_dim),
+        nn.Linear(self.numeric_dim, max(1, proj_dim)),
+        nn.GELU(),
+        nn.Dropout(dropout * 0.5),
       )
-    )
+      classifier_in = 768 + max(1, proj_dim)
+    else:
+      self.numeric = None
+      classifier_in = 768
+    self.dropout = nn.Dropout(dropout)
     self.classifier = nn.Sequential(
-      nn.Dropout(0.1),
-      nn.Linear(768, 384),
-      nn.ReLU(),
-      nn.Dropout(0.1),
+      nn.Linear(classifier_in, 384),
+      nn.GELU(),
+      nn.Dropout(dropout),
       nn.Linear(384, 1),
     )
 
-  def forward(self, input_ids, attention_mask):
-    outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-    cls_embedding = outputs.last_hidden_state[:, 0, :]
-    logits = self.classifier(cls_embedding).squeeze(-1)
-    return logits, cls_embedding
+  def forward(self, input_ids, attention_mask=None, numeric_features=None):
+    cls = self.dropout(self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[:, 0])
+    if self.numeric is not None:
+      if numeric_features is None:
+        numeric_features = torch.zeros((cls.size(0), self.numeric_dim), dtype=cls.dtype, device=cls.device)
+      cls = torch.cat([cls, self.numeric(numeric_features.to(dtype=cls.dtype, device=cls.device))], dim=1)
+    return self.classifier(cls).squeeze(-1)
+
+
+def cfg_ns(raw: dict | None):
+  merged = dict(CFG_DEFAULTS)
+  if raw:
+    merged.update(raw)
+  return SimpleNamespace(**merged)
+
+
+def normalize(text: str) -> str:
+  if pd.isna(text):
+    return ""
+  text = unicodedata.normalize("NFKC", str(text)).replace("\xa0", " ")
+  return re.sub(r"\s+", " ", text).strip()
+
+
+def tokens(text: str) -> List[str]:
+  return re.findall(r"[\wÀ-ỹ]+", normalize(text).lower(), flags=re.UNICODE)
+
+
+def count_words(text: str) -> int:
+  return len(tokens(text))
+
+
+def jaccard(a: str, b: str) -> float:
+  ta, tb = set(tokens(a)), set(tokens(b))
+  return 0.0 if not ta or not tb else len(ta & tb) / max(1, len(ta | tb))
+
+
+def stable_hash(text: str) -> str:
+  import hashlib
+  return hashlib.md5(normalize(text).lower().encode("utf-8")).hexdigest()[:12]
+
+
+def model_input(row) -> str:
+  return f"Tiêu đề: {normalize(row.get('title', ''))}. Từ khóa: {normalize(row.get('tags', ''))}. Câu: {normalize(row.get('sentence', ''))}"
+
+
+def split_sentences(text: str) -> List[str]:
+  text = normalize(text)
+  if not text:
+    return []
+  for abbr in ["TP.", "TP.HCM.", "ThS.", "TS.", "PGS.", "GS.", "Ông.", "Bà.", "Mr.", "Ms.", "Dr.", "P.", "Q."]:
+    text = text.replace(abbr, abbr.replace(".", "<DOT>"))
+  chunks = [c.replace("<DOT>", ".").strip(" -*") for c in re.split(r"(?<=[.!?;:])\s+", re.sub(r"\s*\n+\s*", " ", text)) if c and c.strip()]
+  if len(chunks) <= 1:
+    chunks = [c.strip().replace("<DOT>", ".") for c in re.split(r",\s+", text) if c.strip()]
+  return [c for c in chunks if count_words(c) >= 3]
+
+
+def kw_norm(text: str) -> str:
+  return re.sub(r"\s+", " ", re.sub(r"[^a-zA-ZÀ-ỹ0-9_\s]", " ", normalize(text).lower())).strip()
+
+
+def kw_tokens(text: str):
+  return re.findall(r"[a-zA-ZÀ-ỹ0-9_]+", kw_norm(text))
+
+
+def kw_content(toks):
+  return [t for t in toks if t not in STOPWORDS and len(t) >= 2]
+
+
+def phrase_overlap(a: str, b: str) -> float:
+  ta, tb = set(kw_norm(a).split()), set(kw_norm(b).split())
+  return 0.0 if not ta or not tb else len(ta & tb) / max(1, min(len(ta), len(tb)))
+
+
+def candidate_phrase(phrase: str) -> bool:
+  toks = kw_norm(phrase).split()
+  if not toks:
+    return False
+  content = kw_content(toks)
+  p = " ".join(toks)
+  if p in BAD_PHRASES or toks[0] in BAD_EDGE or toks[-1] in BAD_EDGE:
+    return False
+  if len(toks) == 1:
+    return toks[0] not in STOPWORDS and toks[0] not in GENERIC and len(toks[0]) >= 3
+  return toks[0] not in STOPWORDS and toks[-1] not in STOPWORDS and len(content) >= 2 and not all(t in GENERIC for t in content)
+
+
+def redundant_phrase(phrase: str, selected: list) -> bool:
+  p = kw_norm(phrase)
+  pt = p.split()
+  if not pt:
+    return True
+  for old in selected:
+    o = kw_norm(old)
+    ot = o.split()
+    if f" {p} " in f" {o} " and len(pt) <= len(ot):
+      return True
+    if f" {o} " in f" {p} " and len(pt) <= len(ot) + 1:
+      return True
+    if phrase_overlap(p, o) >= 0.82:
+      return True
+  return False
+
+
+def extract_keyword_phrases(content: str, top_k: int = 8, return_scores: bool = False):
+  sents = split_sentences(content)
+  if not sents:
+    return []
+  token_freq = Counter([t for t in kw_tokens(content) if t not in STOPWORDS and len(t) >= 2])
+  max_tf = max(token_freq.values()) if token_freq else 1
+  stats = defaultdict(lambda: {"freq": 0, "first_sent": 10**9, "first_pos": 10**9, "token_score": 0.0, "kind_bonus": 0.0})
+
+  def chunks(sentence: str):
+    toks, out, cur, start = kw_tokens(sentence), [], [], 0
+    def flush(end_pos):
+      nonlocal cur, start
+      if cur:
+        out.append((cur[:], start, end_pos))
+        cur = []
+    for i, t in enumerate(toks):
+      if t in PHRASE_SPLIT or len(t) < 2 or t.isdigit():
+        flush(i); start = i + 1
+      else:
+        if not cur:
+          start = i
+        cur.append(t)
+    flush(len(toks))
+    return out
+
+  def subphrases(chunk_toks, start_pos):
+    out, length = [], len(chunk_toks)
+    if 2 <= length <= 5:
+      p = " ".join(chunk_toks)
+      if candidate_phrase(p):
+        out.append((p, start_pos, "full"))
+    if length > 5:
+      for s, e, kind in [(0, 5, "head"), (max(0, length - 5), length, "tail")]:
+        p = " ".join(chunk_toks[s:e])
+        if candidate_phrase(p):
+          out.append((p, start_pos + s, kind))
+    for n in [4, 3, 2]:
+      if length < n:
+        continue
+      for s in range(0, length - n + 1):
+        is_edge = s == 0 or s + n == length
+        if not is_edge and n <= 2:
+          continue
+        p = " ".join(chunk_toks[s:s + n])
+        if candidate_phrase(p):
+          out.append((p, start_pos + s, "edge_ngram" if is_edge else "inner_ngram"))
+    return out
+
+  for sent_idx, sent in enumerate(sents):
+    for chunk_toks, start_pos, _ in chunks(sent):
+      for phrase, pos, kind in subphrases(chunk_toks, start_pos):
+        content_toks = kw_content(kw_norm(phrase).split())
+        if len(content_toks) < 2:
+          continue
+        tok_score = sum(token_freq.get(t, 0) / max_tf for t in content_toks) / max(1, len(content_toks))
+        st = stats[kw_norm(phrase)]
+        st["freq"] += 1
+        st["first_sent"] = min(st["first_sent"], sent_idx)
+        st["first_pos"] = min(st["first_pos"], pos)
+        st["token_score"] = max(st["token_score"], tok_score)
+        st["kind_bonus"] = max(st["kind_bonus"], {"full": 0.60, "head": 0.24, "tail": 0.12, "edge_ngram": 0.06, "inner_ngram": 0.0}[kind])
+
+  scored = []
+  for phrase, st in stats.items():
+    n = len(phrase.split())
+    c = kw_content(phrase.split())
+    score = (
+      1.10 * math.log1p(st["freq"])
+      + 0.82 * (1.0 / (1.0 + st["first_sent"]) + 0.18 / (1.0 + st["first_pos"]) + (0.45 if st["first_sent"] == 0 and st["first_pos"] == 0 else 0.0))
+      + 0.52 * st["token_score"]
+      + 0.32 * (len(c) / max(1, n))
+      + {2: 0.15, 3: 0.30, 4: 0.42, 5: 0.30}.get(n, 0.0)
+      + st["kind_bonus"]
+      - (0.08 * (n - 4) if n >= 5 else 0.0)
+    )
+    scored.append((phrase, score))
+
+  picked, out = [], []
+  for phrase, score in sorted(scored, key=lambda x: (x[1], len(x[0].split())), reverse=True):
+    if not candidate_phrase(phrase) or redundant_phrase(phrase, picked):
+      continue
+    picked.append(phrase)
+    out.append((phrase, score))
+    if len(picked) >= top_k:
+      break
+  return out if return_scores else picked
+
+
+def auto_generate_tags(content: str) -> str:
+  return ", ".join(extract_keyword_phrases(content, top_k=8, return_scores=False))
+
+
+def auto_generate_title(content: str, max_words: int = 12) -> str:
+  phrases = extract_keyword_phrases(content, top_k=10, return_scores=True)
+  if not phrases:
+    sents = split_sentences(content)
+    if not sents:
+      return ""
+    words = sents[0].split()
+    return " ".join(words[:max_words]) + ("..." if len(words) > max_words else "")
+  main, main_score = phrases[0]
+  aspect = None
+  main_tokens = set(main.split())
+  for p, s in phrases[1:]:
+    p_tokens = set(p.split())
+    if p_tokens and len(main_tokens | p_tokens) <= max_words and phrase_overlap(main, p) < 0.50 and s >= 0.45 * main_score:
+      aspect = p
+      break
+  title = f"{main} và {aspect}" if aspect else main
+  words = title.split()
+  title = title if len(words) <= max_words else " ".join(words[:max_words])
+  return title[:1].upper() + title[1:] if title else title
+
+
+def build_custom_df(contents, cfg, cluster_id: str = "CUSTOM_CONTENT"):
+  if isinstance(contents, str):
+    contents = [contents]
+  rows, global_pos = [], 0
+  for doc_idx, content in enumerate(contents, start=1):
+    title, tags = normalize(auto_generate_title(content)), normalize(auto_generate_tags(content))
+    for sent_doc_pos, sentence in enumerate(split_sentences(normalize(content))):
+      rows.append({
+        "raw_index": global_pos,
+        "cluster_id": cluster_id,
+        "doc_id": doc_idx,
+        "sent_clus_pos": global_pos,
+        "sent_doc_pos": sent_doc_pos,
+        "sentence": sentence,
+        "title": title,
+        "tags": tags,
+        "oracle_score": 0.0,
+        "n_words": count_words(sentence),
+      })
+      global_pos += 1
+  df = pd.DataFrame(rows)
+  if df.empty:
+    raise ValueError("Không tách được câu nào.")
+  df = add_numeric_features(create_topic_ids_from_title_tags(df), cfg)
+  df["sent_global_index"] = np.arange(len(df))
+  return df
+
+
+def predict_scores(df: pd.DataFrame, model, tokenizer, cfg, batch_size: int = 32) -> np.ndarray:
+  texts = [model_input(row) for _, row in df.iterrows()]
+  feat_cols = list(cfg.NUMERIC_FEATURE_COLUMNS) if getattr(cfg, "USE_NUMERIC_FEATURES", False) else []
+  numeric = df[feat_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).astype("float32").values if feat_cols else np.zeros((len(df), 0), dtype="float32")
+  probs = []
+  with torch.no_grad():
+    for start in range(0, len(texts), batch_size):
+      encoded = tokenizer(texts[start:start + batch_size], truncation=True, max_length=int(cfg.MAX_LEN), padding=True, return_attention_mask=True, return_token_type_ids=False, return_tensors="pt")
+      encoded = {k: v.to(DEVICE) for k, v in encoded.items()}
+      if feat_cols:
+        encoded["numeric_features"] = torch.tensor(numeric[start:start + batch_size], dtype=torch.float32, device=DEVICE)
+      probs.extend(torch.sigmoid(model(**encoded)).detach().cpu().numpy().tolist())
+  return np.asarray(probs, dtype=float)
+
+
+def add_scores(df: pd.DataFrame, probs: np.ndarray, cfg) -> pd.DataFrame:
+  out = df.reset_index(drop=True).copy()
+  out["_orig_idx"] = np.arange(len(out))
+  out["model_score"] = probs
+  out["position_score"] = out.apply(lambda row: 0.7 * (1 / (1 + max(0, row.get("sent_doc_pos", 999)))) + 0.3 * (1 / math.sqrt(1 + max(0, row.get("sent_clus_pos", 999)))), axis=1)
+  freq = Counter([t for t in tokens(" ".join(out["sentence"].fillna("").astype(str).tolist())) if len(t) >= 2 and t not in DECODE_STOP and not t.isdigit()])
+  repeated = {t for t, c in freq.items() if c >= 2} or {t for t, _ in freq.most_common(20)}
+  def relevance(sent: str) -> float:
+    toks = {t for t in tokens(sent) if len(t) >= 2 and t not in DECODE_STOP and not t.isdigit()}
+    if not toks or not repeated:
+      return 0.0
+    return max(len(toks & repeated) / max(1, len(toks)), float(np.mean([jaccard(sent, other) for other in out["sentence"].tolist() if other != sent])) if len(out) > 1 else 0.0)
+  out["topic_relevance"] = out["sentence"].apply(relevance)
+  out["final_score"] = cfg.MMR_ALPHA * out["model_score"] + cfg.POSITION_BONUS_WEIGHT * out["position_score"] + cfg.TOPIC_RELEVANCE_WEIGHT * out["topic_relevance"]
+  return out
+
+
+def runtime_cfg(cfg, scored: pd.DataFrame, mode: str):
+  n_sents = len(scored)
+  if n_sents <= 8:
+    sent_ratio = 0.65
+  elif n_sents <= 16:
+    sent_ratio = 0.52
+  elif n_sents <= 30:
+    sent_ratio = 0.38
+  else:
+    sent_ratio = 0.28
+  target_sents = int(round(n_sents * sent_ratio))
+  target_words = int(scored["sentence"].map(count_words).sum() * (0.42 if mode == "multi_topic_coverage" else 0.45))
+  out = SimpleNamespace(**vars(cfg))
+  out.SUMMARY_MAX_SENTENCES = min(n_sents, clamp_value(target_sents, 3, cfg.ADAPTIVE_MULTI_MAX_SENTENCES if mode == "multi_topic_coverage" else cfg.ADAPTIVE_SINGLE_MAX_SENTENCES))
+  out.SUMMARY_MAX_WORDS = clamp_value(target_words, 80, cfg.ADAPTIVE_MULTI_MAX_WORDS if mode == "multi_topic_coverage" else cfg.ADAPTIVE_SINGLE_MAX_WORDS)
+  out.MIN_REQUIRED_SENTENCES = min(3, out.SUMMARY_MAX_SENTENCES)
+  out.RUNTIME_BUDGET = {"target_sents": out.SUMMARY_MAX_SENTENCES, "target_words": out.SUMMARY_MAX_WORDS, "min_required": out.MIN_REQUIRED_SENTENCES}
+  return out
+
+
+def select_sentences(scored: pd.DataFrame, cfg):
+  mode = "multi_topic_coverage" if (cfg.TASK_MODE == "multi_topic_coverage" or (cfg.TASK_MODE == "auto" and scored["topic_id"].nunique() >= cfg.AUTO_MULTI_TOPIC_MIN_TOPICS)) else "single_topic_enrichment"
+  rcfg = runtime_cfg(cfg, scored, mode)
+  selected, selected_texts, selected_docs, topic_counts, total_words = [], [], set(), Counter(), 0
+  base = scored if mode == "multi_topic_coverage" else (scored[scored["topic_relevance"] >= cfg.TOPIC_RELEVANCE_THRESHOLD] if len(scored) > cfg.MIN_REQUIRED_SENTENCES else scored)
+  valid_topics = base.groupby("topic_id")["final_score"].mean().sort_values(ascending=False).index.tolist()
+  pool = valid_topics if mode == "multi_topic_coverage" else [None]
+  while len(selected) < rcfg.SUMMARY_MAX_SENTENCES:
+    added = False
+    for topic_id in pool:
+      best, best_score = None, -1e18
+      rows = base if topic_id is None else base[base["topic_id"] == topic_id]
+      for _, row in rows.sort_values("final_score", ascending=False).iterrows():
+        if int(row["_orig_idx"]) in selected:
+          continue
+        if row["model_score"] < cfg.MIN_SENT_SCORE and len(selected) >= rcfg.MIN_REQUIRED_SENTENCES:
+          continue
+        words = count_words(row["sentence"])
+        if total_words + words > rcfg.SUMMARY_MAX_WORDS and selected:
+          continue
+        redundancy = max([jaccard(row["sentence"], text) for text in selected_texts], default=0.0)
+        if selected and redundancy > cfg.MAX_REDUNDANCY_JACCARD:
+          continue
+        doc_bonus = 1.0 if row["doc_id"] not in selected_docs else 0.0
+        topic_bonus = 1.0 if topic_id is not None and topic_counts[topic_id] == 0 else 0.0
+        score = float(row["final_score"]) - cfg.REDUNDANCY_WEIGHT * redundancy + cfg.DOC_COVERAGE_WEIGHT * doc_bonus + (cfg.TOPIC_COVERAGE_WEIGHT * topic_bonus if topic_id is not None else 0.0)
+        if score > best_score:
+          best, best_score = row, score
+      if best is not None:
+        selected.append(int(best["_orig_idx"]))
+        selected_texts.append(best["sentence"])
+        selected_docs.add(best["doc_id"])
+        if topic_id is not None:
+          topic_counts[topic_id] += 1
+        total_words += count_words(best["sentence"])
+        added = True
+        if mode == "single_topic_enrichment":
+          break
+    if not added:
+      break
+  if not selected and len(scored):
+    selected = [int(scored.sort_values("final_score", ascending=False).iloc[0]["_orig_idx"])]
+  cfg.LAST_RUNTIME_BUDGET = rcfg.RUNTIME_BUDGET
+  return sorted(selected, key=lambda idx: (scored.set_index("_orig_idx").loc[idx]["sent_clus_pos"], scored.set_index("_orig_idx").loc[idx]["doc_id"], scored.set_index("_orig_idx").loc[idx]["sent_doc_pos"])), mode
+
+
+def summarize_documents(documents: List[str], model, tokenizer, cfg):
+  df = build_custom_df(documents, cfg)
+  scored = add_scores(df, predict_scores(df, model, tokenizer, cfg), cfg)
+  selected, mode = select_sentences(scored, cfg)
+  selected_info = scored.set_index("_orig_idx").loc[selected].reset_index()
+  return {
+    "summary": " ".join(df.iloc[idx]["sentence"] for idx in selected),
+    "selected_info": selected_info,
+    "selected_indices": selected,
+    "scored_df": scored,
+    "decoding_mode": mode,
+    "runtime_budget": getattr(cfg, "LAST_RUNTIME_BUDGET", None),
+  }
 
 
 @lru_cache(maxsize=1)
 def load_artifacts():
-  checkpoint = torch.load(CHECKPOINT_PATH, map_location="cpu")
-  model = ExtractiveSentenceRanker()
+  checkpoint = torch.load(CHECKPOINT_PATH, map_location="cpu", weights_only=False)
+  cfg = cfg_ns(checkpoint.get("cfg"))
+  model = PhoBERTSentenceClassifier(float(cfg.DROPOUT), len(cfg.NUMERIC_FEATURE_COLUMNS) if cfg.USE_NUMERIC_FEATURES else 0, int(cfg.NUMERIC_FEATURE_PROJ_DIM))
   model.load_state_dict(checkpoint["model_state_dict"])
-  model.to(DEFAULT_DEVICE)
+  model.to(DEVICE)
   model.eval()
   tokenizer = PhobertTokenizer.from_pretrained(str(TOKENIZER_DIR))
-  return model, tokenizer, checkpoint["config"], checkpoint
-
-
-def split_sentences(text: str) -> List[str]:
-  normalized = re.sub(r"\s+", " ", text).strip()
-  if not normalized:
-    return []
-  raw_sentences = re.split(r"(?<=[\.\!\?\…])\s+|(?<=\n)\s*", normalized)
-  sentences = [sentence.strip(" -\n\t") for sentence in raw_sentences]
-  return [sentence for sentence in sentences if len(sentence.split()) >= 4]
-
-
-def build_candidates(documents: List[str]):
-  candidates = []
-  for doc_index, document in enumerate(documents):
-    for position, sentence in enumerate(split_sentences(document)):
-      candidates.append(
-        {
-          "text": sentence,
-          "document_index": doc_index,
-          "position": position,
-        }
-      )
-  return candidates
-
-
-def batched(iterable, batch_size: int):
-  for index in range(0, len(iterable), batch_size):
-    yield iterable[index:index + batch_size]
-
-
-def encode_candidates(candidates: List[dict], tokenizer, model, max_len: int):
-  texts = [candidate["text"] for candidate in candidates]
-  all_probs = []
-  all_embeddings = []
-
-  with torch.no_grad():
-    for batch in batched(texts, 16):
-      encoded = tokenizer(
-        batch,
-        padding=True,
-        truncation=True,
-        max_length=max_len,
-        return_tensors="pt",
-      )
-      encoded.pop("token_type_ids", None)
-      encoded = {key: value.to(DEFAULT_DEVICE) for key, value in encoded.items()}
-      logits, embeddings = model(**encoded)
-      probs = torch.sigmoid(logits).detach().cpu().numpy()
-      all_probs.append(probs)
-      all_embeddings.append(embeddings.detach().cpu().numpy())
-
-  return np.concatenate(all_probs), np.concatenate(all_embeddings)
-
-
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-  denominator = np.linalg.norm(a) * np.linalg.norm(b)
-  if denominator == 0:
-    return 0.0
-  return float(np.dot(a, b) / denominator)
-
-
-def score_candidates(candidates: List[dict], probabilities: np.ndarray, embeddings: np.ndarray, config: dict):
-  doc_count = max((candidate["document_index"] for candidate in candidates), default=-1) + 1
-  doc_seen = [0] * max(doc_count, 1)
-  centroid = embeddings.mean(axis=0) if len(embeddings) else np.zeros((768,), dtype=np.float32)
-
-  for index, candidate in enumerate(candidates):
-    candidate["probability"] = float(probabilities[index])
-    candidate["embedding"] = embeddings[index]
-    position_bonus = max(0.0, 1.0 - (candidate["position"] * 0.12)) * config.get("POSITION_WEIGHT", 0.06)
-    centrality_bonus = max(0.0, cosine_similarity(candidate["embedding"], centroid)) * config.get("CENTRALITY_WEIGHT", 0.16)
-    doc_bonus = (1.0 / (1 + doc_seen[candidate["document_index"]])) * config.get("DOC_COVERAGE_BONUS_WEIGHT", 0.32)
-    candidate["score"] = candidate["probability"] + position_bonus + centrality_bonus + doc_bonus
-    doc_seen[candidate["document_index"]] += 1
-
-
-def redundancy_ratio(a: str, b: str) -> float:
-  tokens_a = set(a.lower().split())
-  tokens_b = set(b.lower().split())
-  union = tokens_a | tokens_b
-  if not union:
-    return 0.0
-  return len(tokens_a & tokens_b) / len(union)
-
-
-def select_sentences(candidates: List[dict], config: dict):
-  selected = []
-  max_sentences = int(config.get("MAX_SUMMARY_SENTENCES", 8))
-  max_words = int(config.get("MAX_SUMMARY_WORDS", 220))
-  threshold = float(config.get("POSITIVE_THRESHOLD", 0.24))
-  redundancy_limit = float(config.get("MAX_REDUNDANCY_JACCARD", 0.48))
-  mmr_lambda = float(config.get("MMR_LAMBDA", 0.68))
-
-  candidates = sorted(candidates, key=lambda item: item["score"], reverse=True)
-  current_words = 0
-  covered_docs = set()
-
-  while candidates and len(selected) < max_sentences and current_words < max_words:
-    best_index = None
-    best_value = -1e9
-
-    for index, candidate in enumerate(candidates):
-      if candidate["probability"] < threshold and selected:
-        continue
-
-      if any(redundancy_ratio(candidate["text"], picked["text"]) > redundancy_limit for picked in selected):
-        continue
-
-      if current_words + len(candidate["text"].split()) > max_words:
-        continue
-
-      redundancy_penalty = 0.0
-      if selected:
-        redundancy_penalty = max(
-          cosine_similarity(candidate["embedding"], picked["embedding"]) for picked in selected
-        )
-
-      doc_bonus = 0.0 if candidate["document_index"] in covered_docs else config.get("DOC_COVERAGE_BONUS_WEIGHT", 0.32)
-      mmr_value = (mmr_lambda * candidate["score"]) - ((1.0 - mmr_lambda) * redundancy_penalty) + doc_bonus
-
-      if mmr_value > best_value:
-        best_value = mmr_value
-        best_index = index
-
-    if best_index is None:
-      break
-
-    chosen = candidates.pop(best_index)
-    selected.append(chosen)
-    current_words += len(chosen["text"].split())
-    covered_docs.add(chosen["document_index"])
-
-  if not selected and candidates:
-    selected = [candidates[0]]
-
-  return sorted(selected, key=lambda item: (item["document_index"], item["position"]))
+  return model, tokenizer, cfg, checkpoint
 
 
 @app.on_event("startup")
@@ -230,46 +530,28 @@ def startup_event():
 @app.get("/health")
 def health():
   _, _, _, checkpoint = load_artifacts()
-  return {
-    "status": "ok",
-    "device": DEFAULT_DEVICE,
-    "model_path": str(CHECKPOINT_PATH),
-    "val_f1": checkpoint["val_f1"],
-    "val_rouge": checkpoint["val_rouge"],
-  }
+  return {"status": "ok", "device": DEVICE, "model_path": str(CHECKPOINT_PATH), "threshold": checkpoint.get("threshold"), "best_epoch": checkpoint.get("best_epoch"), "best_score": checkpoint.get("best_score")}
 
 
 @app.post("/api/summarize", response_model=SummarizeResponse)
 def summarize(payload: SummarizeRequest):
-  documents = [document.strip() for document in payload.documents if document and document.strip()]
+  documents = [d.strip() for d in payload.documents if d and d.strip()]
   if not documents:
     return SummarizeResponse(summary="", sentences=[], meta={"message": "No documents provided"})
-
-  model, tokenizer, config, checkpoint = load_artifacts()
-  candidates = build_candidates(documents)
-
-  if not candidates:
-    return SummarizeResponse(summary="", sentences=[], meta={"message": "No valid sentences extracted"})
-
-  probabilities, embeddings = encode_candidates(candidates, tokenizer, model, int(config.get("MAX_LEN", 256)))
-  score_candidates(candidates, probabilities, embeddings, config)
-  selected = select_sentences(candidates, config)
-  summary = " ".join(item["text"] for item in selected)
-
+  model, tokenizer, cfg, checkpoint = load_artifacts()
+  result = summarize_documents(documents, model, tokenizer, cfg)
   return SummarizeResponse(
-    summary=summary,
+    summary=result["summary"],
     sentences=[
-      SentenceCandidate(
-        text=item["text"],
-        document_index=item["document_index"],
-        probability=round(item["probability"], 4),
-      )
-      for item in selected
+      SentenceCandidate(text=row["sentence"], document_index=int(row["doc_id"]) - 1, probability=round(float(row["model_score"]), 4))
+      for _, row in result["selected_info"].iterrows()
     ],
     meta={
-      "device": DEFAULT_DEVICE,
-      "candidate_count": len(candidates),
-      "selected_count": len(selected),
-      "threshold": checkpoint["val_best_threshold"],
+      "device": DEVICE,
+      "candidate_count": int(len(result["scored_df"])),
+      "selected_count": int(len(result["selected_indices"])),
+      "threshold": checkpoint.get("threshold"),
+      "decoding_mode": result["decoding_mode"],
+      "runtime_budget": result["runtime_budget"],
     },
   )
