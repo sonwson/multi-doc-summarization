@@ -83,7 +83,7 @@ Mở 3 terminal riêng.
 
 ```powershell
 cd D:\multi-documents_summarization\ai-service
-uvicorn app:app --reload --host 127.0.0.1 --port 8000
+python -m uvicorn app:app --host 127.0.0.1 --port 8000  
 ```
 
 Health check:
@@ -133,3 +133,5 @@ Nếu frontend mở được nhưng bấm tóm tắt không chạy, kiểm tra l
 
 - `results/checkpoints_extractive/best_extractive_sentence_model.bin`
 - `results/checkpoints_extractive/tokenizer/`
+
+Luu y: service hien tai uu tien tu dong chon checkpoint moi nhat trong `results/`, uu tien `results/phobert_single_topic_outputs/best_model.pt`, va chi fallback ve `phobert_outputs/best_model.pt` neu khong tim thay artifact hop le.
